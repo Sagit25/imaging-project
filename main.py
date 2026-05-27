@@ -41,10 +41,9 @@ def main():
 
     if args.mode == "train":
         dataset = MirrorReflectionsDataset(args.data_dir, image_size=256)
-        # drop_last=True: 마지막 배치가 작아서 발생하는 차원 오류 방지
         dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, drop_last=True)
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-        scaler = torch.cuda.amp.GradScaler() # 자동 혼합 정밀도
+        scaler = torch.cuda.amp.GradScaler()
         
         print(f"Starting advanced Flow Matching training on {device}...")
         for epoch in range(1, args.epochs + 1):
@@ -74,7 +73,6 @@ def main():
                 
                 samples = (samples * 0.5 + 0.5).clamp(0, 1)
                 gt = (x_1[:4] * 0.5 + 0.5).clamp(0, 1)
-                # condition 중 실제 시각적 왜곡 이미지만 추출 (채널 0~2)
                 distorted = (sample_cond[:, :3] * 0.5 + 0.5).clamp(0, 1)
                 
                 comparison = torch.cat([distorted, samples, gt], dim=0)
