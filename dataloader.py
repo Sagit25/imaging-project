@@ -1,47 +1,55 @@
+import os
+import glob
+import torch
 from torch.utils.data import Dataset
 from torchvision import transforms
 from PIL import Image
-import torch
-import os
 
-
-# 이 데이터셋은 그냥 대강 이미지가 어떻게 들어오겠다라고 굉장히 대강 만들었기에, 추후 실제 이미지셋에 맞게 수정필요!!!
 class MirrorReflectionsDataset(Dataset):
-    def __init__(self, root_dir, image_size=128):
+    def __init__(self, root_dir, image_size=256, is_train=True):
         self.root_dir = root_dir
         self.image_size = image_size
+        self.is_train = is_train
+        
+        # Normalize for model input: [-1, 1]
         self.transform = transforms.Compose([
             transforms.Resize((image_size, image_size)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5], std=[0.5])
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
         ])
-        self.mask_transform = transforms.Compose([
+        
+        # For mask generation (0 or 1)
+        self.raw_transform = transforms.Compose([
             transforms.Resize((image_size, image_size)),
             transforms.ToTensor()
         ])
-        
-        self.distorted_dir = os.path.join(root_dir, 'distorted')
-        self.masks_dir = os.path.join(root_dir, 'masks')
-        self.unwarped_dir = os.path.join(root_dir, 'unwarped')
-        
-        if os.path.exists(self.distorted_dir):
-            self.image_files = sorted(os.listdir(self.distorted_dir))
-        else:
-            self.image_files = []
+
+        search_pattern = os.path.join(root_dir, '*_input.png')
+        self.input_files = sorted(glob.glob(search_pattern))
 
     def __len__(self):
-        return len(self.image_files)
+        return len(self.input_files)
 
     def __getitem__(self, idx):
-        filename = self.image_files[idx]
-        
-        dist_img = Image.open(os.path.join(self.distorted_dir, filename)).convert('RGB')
-        mask_img = Image.open(os.path.join(self.masks_dir, filename)).convert('L')
-        unwarped_img = Image.open(os.path.join(self.unwarped_dir, filename)).convert('RGB')
+        input_path = self.input_files[idx]
+
+        base_name = os.path.basename(input_path)
+        file_id = base_name.rsplit('_input', 1)[0]
+        gt_path = os.path.join(self.root_dir, f"{file_id}_gt.png")
+
+        if gt_path is None:
+            raise FileNotFoundError(f"None ground truth file found for: {file_id}_gt")
+
+        dist_img = Image.open(input_path).convert('RGB')
+        unwarped_img = Image.open(gt_path).convert('RGB')
         
         dist_tensor = self.transform(dist_img)
         unwarped_tensor = self.transform(unwarped_img)
-        mask_tensor = self.mask_transform(mask_img)
         
-        condition = torch.cat([dist_tensor, mask_tensor], dim=0)
+        # Generate mask and condition
+        raw_dist_tensor = self.raw_transform(dist_img)
+        mask_tensor = (raw_dist_tensor.sum(dim=0, keepdim=True) > 0.0).float()
+        masked_dist_tensor = dist_tensor * mask_tensor
+        condition = torch.cat([masked_dist_tensor, mask_tensor], dim=0)
+        
         return condition, unwarped_tensor

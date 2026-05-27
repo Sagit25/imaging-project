@@ -2,54 +2,58 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+class ResBlock(nn.Module):
+    def __init__(self, channels, emb_dim):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.time_emb_proj = nn.Linear(emb_dim, channels)
+        
+    def forward(self, x, t_emb):
+        h = F.silu(self.conv1(x))
+        t_proj = self.time_emb_proj(t_emb).unsqueeze(-1).unsqueeze(-1)
+        h = h + t_proj
+        h = self.conv2(F.silu(h))
+        return x + h
 
-# Basic unet과 이를 토대로 cfg flow matcher 구현 (diffusion x), 추후 실제 모델에 맞게 수정 필요!
-
-class SimpleUNet(nn.Module):
-    def __init__(self, in_channels=3, cond_channels=4, base_dim=64):
+class FlowUNet(nn.Module):
+    def __init__(self, in_channels=3, cond_channels=4, base_dim=128):
         super().__init__()
         self.time_mlp = nn.Sequential(
             nn.Linear(1, base_dim * 4), nn.SiLU(), nn.Linear(base_dim * 4, base_dim * 4)
         )
         
         # Down
-        self.down1 = nn.Conv2d(in_channels + cond_channels, base_dim, 3, padding=1)
+        self.init_conv = nn.Conv2d(in_channels + cond_channels, base_dim, 3, padding=1)
+        self.down1 = ResBlock(base_dim, base_dim * 4)
         self.down2 = nn.Conv2d(base_dim, base_dim * 2, 4, stride=2, padding=1)
+        self.down3 = ResBlock(base_dim * 2, base_dim * 4)
         
         # Mid
-        self.time_emb_proj = nn.Linear(base_dim * 4, base_dim * 2)
-        self.mid1 = nn.Conv2d(base_dim * 2, base_dim * 2, 3, padding=1)
-        self.mid2 = nn.Conv2d(base_dim * 2, base_dim * 2, 3, padding=1)
+        self.mid1 = ResBlock(base_dim * 2, base_dim * 4)
         
         # Up
         self.up1 = nn.ConvTranspose2d(base_dim * 2, base_dim, 4, stride=2, padding=1)
-        self.up2 = nn.Conv2d(base_dim * 2, in_channels, 3, padding=1)
+        self.up2 = ResBlock(base_dim * 2, base_dim * 4) # Skip connection concat consideration
+        self.final_conv = nn.Conv2d(base_dim, in_channels, 3, padding=1)
 
     def forward(self, x_t, t, condition):
-        # Time embedding
         t_emb = self.time_mlp(t.view(-1, 1))
         
-        # Concat condition
         x = torch.cat([x_t, condition], dim=1)
+        x = self.init_conv(x)
         
-        # Downpass
-        d1 = F.silu(self.down1(x))
-        d2 = F.silu(self.down2(d1))
+        d1 = self.down1(x, t_emb)
+        d2 = self.down2(d1)
+        d3 = self.down3(d2, t_emb)
         
-        # Midpass with Time Injection
-        t_proj = self.time_emb_proj(t_emb).view(-1, d2.shape[1], 1, 1)
-        m = d2 + t_proj
-        m = F.silu(self.mid1(m))
-        m = F.silu(self.mid2(m))
+        m = self.mid1(d3, t_emb)
         
-        # Uppass
-        u1 = F.silu(self.up1(m))
-        # Skip connection
-        u1 = torch.cat([u1, d1], dim=1) 
-        out = self.up2(u1)
+        u1 = self.up1(m)
+        u1_concat = torch.cat([u1, d1], dim=1)
+        u2 = self.up2(u1_concat, t_emb)
         
-        return out
-
+        return self.final_conv(u2)
 
 class CFGFlowMatcher:
     def __init__(self, model, cfg_drop_rate=0.1):
@@ -60,7 +64,7 @@ class CFGFlowMatcher:
         B = x_1.shape[0]
         device = x_1.device
 
-        # OT Path
+        # Flow Matching Optimal Transport Path
         t = torch.rand(B, 1, 1, 1, device=device)
         x_0 = torch.randn_like(x_1)
         x_t = t * x_1 + (1 - t) * x_0
@@ -90,6 +94,7 @@ class CFGFlowMatcher:
             v_uncond = self.model(x_t, t, null_condition)
             v_cfg = v_uncond + cfg_scale * (v_cond - v_uncond)
             
+            # Euler Integration
             x_t = x_t + v_cfg * dt
             
         return x_t
