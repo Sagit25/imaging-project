@@ -46,10 +46,17 @@ class MirrorReflectionsDataset(Dataset):
         dist_tensor = self.transform(dist_img)
         unwarped_tensor = self.transform(unwarped_img)
         
-        # Generate mask and condition
+        # Generate mask and condition (condition: [image, mask, grid_x, grid_y])
         raw_dist_tensor = self.raw_transform(dist_img)
-        mask_tensor = (raw_dist_tensor.sum(dim=0, keepdim=True) > 0.0).float()
+        mask_tensor = (raw_dist_tensor.sum(dim=0, keepdim=True) > 0.05).float()
         masked_dist_tensor = dist_tensor * mask_tensor
-        condition = torch.cat([masked_dist_tensor, mask_tensor], dim=0)
+        h, w = self.image_size, self.image_size
+        grid_y, grid_x = torch.meshgrid(
+            torch.linspace(-1, 1, h), 
+            torch.linspace(-1, 1, w), 
+            indexing='ij'
+        )
+        grid_coords = torch.stack([grid_x, grid_y], dim=0) # [2, H, W]
+        condition = torch.cat([masked_dist_tensor, mask_tensor, grid_coords], dim=0)
         
         return condition, unwarped_tensor
