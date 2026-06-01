@@ -22,7 +22,12 @@ def main():
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     
     # Define unet model
     model = UNetModel(
@@ -31,7 +36,7 @@ def main():
         model_channels=128,
         out_channels=3,
         num_res_blocks=2,
-        attention_resolutions="16,8",   
+        attention_resolutions=(8, 16),   
         dropout=0.1,
         channel_mult=(1, 2, 2, 4, 4),   
         use_checkpoint=True             
@@ -43,7 +48,7 @@ def main():
         dataset = MirrorReflectionsDataset(args.data_dir, image_size=256)
         dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, drop_last=True)
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-        scaler = torch.cuda.amp.GradScaler()
+        scaler = torch.amp.GradScaler()
         
         print(f"Starting advanced Flow Matching training on {device}...")
         for epoch in range(1, args.epochs + 1):
@@ -55,7 +60,7 @@ def main():
                 condition, x_1 = condition.to(device), x_1.to(device)
                 
                 optimizer.zero_grad()
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast(device_type=device.type):
                     loss = flow_matcher.compute_loss(x_1, condition)
                 
                 scaler.scale(loss).backward()
