@@ -37,10 +37,12 @@ class MirrorReflectionsDataset(Dataset):
         file_id = base_name.rsplit('_input', 1)[0]
         gt_path = os.path.join(self.root_dir, f"{file_id}_gt.png")
 
-        if gt_path is None:
-            raise FileNotFoundError(f"None ground truth file found for: {file_id}_gt")
+        if not os.path.exists(gt_path):
+            raise FileNotFoundError(f"Ground truth file not found for: {file_id}_gt")
 
-        dist_img = Image.open(input_path).convert('RGB')
+        # Mirror reconstruction: flip the distorted input left-right so the
+        # network only has to learn the undistortion, not the mirror flip.
+        dist_img = Image.open(input_path).convert('RGB').transpose(Image.FLIP_LEFT_RIGHT)
         unwarped_img = Image.open(gt_path).convert('RGB')
         
         dist_tensor = self.transform(dist_img)
@@ -49,7 +51,6 @@ class MirrorReflectionsDataset(Dataset):
         # Generate mask and condition (condition: [image, mask, grid_x, grid_y])
         raw_dist_tensor = self.raw_transform(dist_img)
         mask_tensor = (raw_dist_tensor.sum(dim=0, keepdim=True) > 0.05).float()
-        masked_dist_tensor = dist_tensor * mask_tensor
         h, w = self.image_size, self.image_size
         grid_y, grid_x = torch.meshgrid(
             torch.linspace(-1, 1, h), 
@@ -57,6 +58,6 @@ class MirrorReflectionsDataset(Dataset):
             indexing='ij'
         )
         grid_coords = torch.stack([grid_x, grid_y], dim=0) # [2, H, W]
-        condition = torch.cat([masked_dist_tensor, mask_tensor, grid_coords], dim=0)
+        condition = torch.cat([dist_tensor, mask_tensor, grid_coords], dim=0)
         
         return condition, unwarped_tensor

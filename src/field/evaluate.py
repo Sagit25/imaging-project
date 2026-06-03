@@ -1,24 +1,27 @@
 import os
 import argparse
+import tempfile
+from pathlib import Path
+
+os.environ.setdefault("MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "matplotlib"))
+os.environ.setdefault("XDG_CACHE_HOME", tempfile.gettempdir())
+os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
+os.makedirs(os.path.join(os.environ["XDG_CACHE_HOME"], "fontconfig"), exist_ok=True)
+
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 
 from dataloader import MirrorReflectionsDataset
-from warping_model import SpatialWarpingModule
+from warp_model import SpatialWarpingModule
 from unet import UNetModel
 
-def evaluate():
-    parser = argparse.ArgumentParser(description="Evaluate Deterministic Spatial Warping Rectification")
-    parser.add_argument("--data_dir", type=str, default="./dataset/test", help="Path to test dataset")
-    parser.add_argument("--ckpt", type=str, required=True, help="Path to model checkpoint")
-    parser.add_argument("--batch_size", type=int, default=8)
-    args = parser.parse_args()
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    model = UNetModel(
+
+def build_model(device):
+    return UNetModel(
         image_size=256,
         in_channels=5,
         model_channels=128,
@@ -29,13 +32,26 @@ def evaluate():
         channel_mult=(1, 2, 2, 4, 4),
         use_checkpoint=True
     ).to(device)
+
+def evaluate():
+    parser = argparse.ArgumentParser(description="Evaluate Deterministic Spatial Warping Rectification")
+    parser.add_argument("--data_dir", type=str, default=str(REPO_ROOT / "dataset"), help="Path to test dataset")
+    parser.add_argument("--ckpt", type=str, required=True, help="Path to model checkpoint")
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--max_batches", type=int, default=0, help="Optional limit for smoke tests; 0 evaluates all batches")
+    args = parser.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
     
+    model = build_model(device)
     model.load_state_dict(torch.load(args.ckpt, map_location=device))
     model.eval()
     
     warper = SpatialWarpingModule(model)
     
     dataset = MirrorReflectionsDataset(args.data_dir, image_size=256, is_train=False)
+    if len(dataset) == 0:
+        raise ValueError(f"No input images found in {args.data_dir}")
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
     
     psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
@@ -48,7 +64,9 @@ def evaluate():
     print(f"Starting evaluation on {len(dataset)} images...")
     
     with torch.no_grad():
-        for model_input, dist_tensor, gt_tensor in tqdm(dataloader, desc="Evaluating"):
+        for batch_idx, (model_input, dist_tensor, gt_tensor) in enumerate(tqdm(dataloader, desc="Evaluating")):
+            if args.max_batches and batch_idx >= args.max_batches:
+                break
             model_input = model_input.to(device)
             dist_tensor = dist_tensor.to(device)
             gt_tensor = gt_tensor.to(device)
@@ -67,6 +85,9 @@ def evaluate():
             total_ssim += ssim_val.item()
             num_batches += 1
             
+    if num_batches == 0:
+        raise ValueError("No evaluation batches available; lower --batch_size or add more data.")
+
     avg_psnr = total_psnr / num_batches
     avg_ssim = total_ssim / num_batches
     

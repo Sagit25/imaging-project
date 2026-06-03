@@ -8,8 +8,8 @@ from diffusers import DiffusionPipeline
 
 from huggingface_hub import login
 import os
-from utils import seed_everything, save_images
-from diffusion_model import DiffusionProcess
+from src.diffusion.utils import seed_everything, save_images
+from src.diffusion.diffusion_model import DiffusionProcess
 
 # 요거는 저번학기 다른 수업 프로젝트에서 사용한 파일인데, 그냥 diffusion model을 사용할거라면, 이를 수정해서 사용해도 괜찮을듯?
 
