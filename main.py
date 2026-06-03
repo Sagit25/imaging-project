@@ -18,7 +18,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--ckpt", type=str, default="")
-    parser.add_argument("--cfg_scale", type=float, default=4.0, help="Scale to balance realism and fidelity")
+    parser.add_argument("--cfg_scale", type=float, default=2.0, help="Scale to balance realism and fidelity")
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -36,7 +36,7 @@ def main():
         model_channels=128,
         out_channels=3,
         num_res_blocks=2,
-        attention_resolutions=(8, 16),   
+        attention_resolutions=(4, 8, 16),   
         dropout=0.1,
         channel_mult=(1, 2, 2, 4, 4),   
         use_checkpoint=True             
@@ -73,7 +73,7 @@ def main():
             if epoch % 10 == 0:
                 torch.save(model.state_dict(), os.path.join(args.out_dir, f"model_ep{epoch}.pth"))
                 model.eval()
-                sample_cond = condition[:4]
+                sample_cond = condition
                 samples = flow_matcher.sample(sample_cond, num_steps=50, cfg_scale=args.cfg_scale)
                 
                 samples = (samples * 0.5 + 0.5).clamp(0, 1)
