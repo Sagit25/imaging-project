@@ -1,4 +1,5 @@
 wandb/
 dataset/
+results/
 __pycache__/
 .DS_Store
