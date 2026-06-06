@@ -47,33 +47,21 @@ class SpatialWarpingModule(nn.Module):
 
         flow_field = self.model(model_input, torch.zeros(B, device=device))
         warped_rgb = self.forward_warp(dist_tensor, flow_field, padding_mode='border')
-        warped_mask = self.forward_warp(model_input[:, 3:4], flow_field, padding_mode='zeros').clamp(0, 1)
-        warped_border = self.forward_warp(model_input[:, 4:5], flow_field, padding_mode='zeros').clamp(0, 1)
-        hole_mask = (1.0 - warped_mask).clamp(0, 1)
 
         return {
             "flow": flow_field,
             "warped_rgb": warped_rgb,
-            "warped_mask": warped_mask,
-            "warped_border": warped_border,
-            "hole_mask": hole_mask,
         }
-
-    def weighted_l1_loss(self, pred, target, weight):
-        weight = weight.expand_as(pred)
-        denom = weight.sum().clamp_min(1.0)
-        return (torch.abs(pred - target) * weight).sum() / denom
 
     def compute_loss(self, model_input, dist_tensor, gt_tensor):
         """
-        model_input: [B, 7, H, W]
+        model_input: [B, 5, H, W]
         dist_tensor: [B, 3, H, W]
         gt_tensor: [B, 3, H, W]
         """
         outputs = self.build_warp_outputs(model_input, dist_tensor)
-        valid_weight = (outputs["warped_mask"] * (1.0 - outputs["warped_border"])).detach()
 
-        recon_loss = self.weighted_l1_loss(outputs["warped_rgb"], gt_tensor, valid_weight)
+        recon_loss = F.mse_loss(outputs["warped_rgb"], gt_tensor)
         smooth_loss = self.flow_smoothness_loss(outputs["flow"])
         total_loss = recon_loss + self.smoothness_weight * smooth_loss
 

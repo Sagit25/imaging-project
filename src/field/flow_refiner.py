@@ -7,7 +7,7 @@ class CFGFlowRefiner:
         self.cfg_drop_rate = cfg_drop_rate
         self.grid_channels = grid_channels
 
-    def compute_loss(self, target, condition, pixel_weight=None):
+    def compute_loss(self, target, condition):
         B = target.shape[0]
         device = target.device
 
@@ -22,12 +22,7 @@ class CFGFlowRefiner:
         unet_input = torch.cat([x_t, condition_masked], dim=1)
         pred_v = self.model(unet_input, t * 1000.0)
 
-        loss = (pred_v - target_v) ** 2
-        if pixel_weight is None:
-            return loss.mean()
-
-        weight = pixel_weight.expand_as(loss)
-        return (loss * weight).sum() / weight.sum().clamp_min(1.0)
+        return ((pred_v - target_v) ** 2).mean()
 
     def _drop_condition(self, condition):
         if self.cfg_drop_rate <= 0 or not self.model.training:
@@ -76,15 +71,7 @@ def build_refiner_condition(model_input, dist_tensor, warp_outputs):
         [
             warp_outputs["warped_rgb"],
             dist_tensor,
-            warp_outputs["warped_mask"],
-            warp_outputs["warped_border"],
-            warp_outputs["hole_mask"],
             model_input[:, -2:],
         ],
         dim=1,
     )
-
-
-def build_refiner_weight(warp_outputs, border_boost=2.0, hole_boost=3.0):
-    weight = 1.0 + border_boost * warp_outputs["warped_border"] + hole_boost * warp_outputs["hole_mask"]
-    return weight.clamp_min(1.0)

@@ -13,7 +13,7 @@ except ImportError:
     wandb = None
 
 from dataloader import MirrorReflectionsDataset
-from flow_refiner import CFGFlowRefiner, build_refiner_condition, build_refiner_weight
+from flow_refiner import CFGFlowRefiner, build_refiner_condition
 from warp_model import SpatialWarpingModule
 from unet import UNetModel
 
@@ -23,7 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 def build_warp_model(device):
     return UNetModel(
         image_size=256,
-        in_channels=7,
+        in_channels=5,
         model_channels=128,
         out_channels=2,
         num_res_blocks=2,
@@ -37,7 +37,7 @@ def build_warp_model(device):
 def build_refiner_model(device):
     return UNetModel(
         image_size=256,
-        in_channels=14,
+        in_channels=11,
         model_channels=64,
         out_channels=3,
         num_res_blocks=2,
@@ -48,31 +48,16 @@ def build_refiner_model(device):
     ).to(device)
 
 
-def build_datasets(data_dir, image_size=256, border_width=5, val_fraction=0.1, seed=0):
+def build_datasets(data_dir, image_size=256, val_fraction=0.1, seed=0):
     train_dir = os.path.join(data_dir, "train")
     val_dir = os.path.join(data_dir, "val")
-    train_dataset = MirrorReflectionsDataset(
-        train_dir,
-        image_size=image_size,
-        is_train=True,
-        border_width=border_width,
-    )
-    val_dataset = MirrorReflectionsDataset(
-        val_dir,
-        image_size=image_size,
-        is_train=False,
-        border_width=border_width,
-    )
+    train_dataset = MirrorReflectionsDataset(train_dir, image_size=image_size, is_train=True)
+    val_dataset = MirrorReflectionsDataset(val_dir, image_size=image_size, is_train=False)
 
     if len(train_dataset) > 0 and len(val_dataset) > 0:
         return train_dataset, val_dataset, f"Using split dataset: {train_dir}, {val_dir}"
 
-    flat_dataset = MirrorReflectionsDataset(
-        data_dir,
-        image_size=image_size,
-        is_train=True,
-        border_width=border_width,
-    )
+    flat_dataset = MirrorReflectionsDataset(data_dir, image_size=image_size, is_train=True)
     if len(flat_dataset) == 0:
         raise ValueError(
             f"No input images found in {data_dir}. Expected *_input.png files in "
@@ -133,6 +118,14 @@ def denormalize_image(tensor):
     return (tensor * 0.5 + 0.5).clamp(0, 1)
 
 
+def should_use_refiner(sample_stage, epoch, warmup_epochs):
+    if sample_stage == "warp":
+        return False
+    if sample_stage == "refine":
+        return True
+    return epoch > warmup_epochs
+
+
 def compute_hybrid_loss(
     warper,
     flow_refiner,
@@ -149,8 +142,7 @@ def compute_hybrid_loss(
         loss = warp_loss
     else:
         condition = build_comparison_condition(model_input, dist_tensor, warp_outputs)
-        pixel_weight = build_refiner_weight(warp_outputs)
-        refine_loss = flow_refiner.compute_loss(gt_tensor, condition, pixel_weight=pixel_weight)
+        refine_loss = flow_refiner.compute_loss(gt_tensor, condition)
         loss = refine_loss + args.warp_loss_weight * warp_loss
 
     return loss, warp_loss, refine_loss, warp_outputs
@@ -165,22 +157,28 @@ def save_and_log_samples(
     dist_tensor,
     gt_tensor,
     args,
+    use_refiner,
     wandb_run=None,
     step=None,
 ):
     warp_outputs = warper.build_warp_outputs(model_input, dist_tensor)
-    condition = build_comparison_condition(model_input, dist_tensor, warp_outputs)
-    refined_pred = flow_refiner.sample(
-        condition,
-        num_steps=args.sample_steps,
-        cfg_scale=args.cfg_scale,
-    )
+    if use_refiner:
+        condition = build_comparison_condition(model_input, dist_tensor, warp_outputs)
+        final_pred = flow_refiner.sample(
+            condition,
+            num_steps=args.sample_steps,
+            cfg_scale=args.cfg_scale,
+        )
+        stage = "refine"
+    else:
+        final_pred = warp_outputs["warped_rgb"]
+        stage = "warp"
 
     comparison = torch.cat(
         [
             denormalize_image(dist_tensor),
             denormalize_image(warp_outputs["warped_rgb"]),
-            denormalize_image(refined_pred),
+            denormalize_image(final_pred),
             denormalize_image(gt_tensor),
         ],
         dim=0,
@@ -191,7 +189,10 @@ def save_and_log_samples(
         grid = make_grid(comparison, nrow=dist_tensor.shape[0])
         wandb_log(
             wandb_run,
-            {"val/samples": wandb.Image(grid, caption="rows: distorted / warped / refined / ground-truth")},
+            {
+                "val/samples": wandb.Image(grid, caption=f"rows: distorted / warped / {stage} / ground-truth"),
+                "sample/stage": stage,
+            },
             step=step,
         )
 
@@ -212,7 +213,7 @@ def main():
     parser.add_argument("--cfg_drop_rate", type=float, default=0.15)
     parser.add_argument("--cfg_scale", type=float, default=3.0)
     parser.add_argument("--sample_steps", type=int, default=50)
-    parser.add_argument("--border_width", type=int, default=5)
+    parser.add_argument("--sample_stage", type=str, choices=["auto", "warp", "refine"], default="auto")
     parser.add_argument("--save_every", type=int, default=10)
     parser.add_argument("--max_batches", type=int, default=0, help="Optional limit for smoke tests; 0 uses all batches")
     parser.add_argument("--num_workers", type=int, default=0, help="DataLoader worker count")
@@ -244,7 +245,6 @@ def main():
     train_dataset, val_dataset, dataset_message = build_datasets(
         args.data_dir,
         image_size=256,
-        border_width=args.border_width,
     )
     print(dataset_message)
 
@@ -434,6 +434,7 @@ def main():
                 ckpt_path = os.path.join(out_dir, f"hybrid_field_ep{epoch:03d}.pth")
                 save_hybrid_checkpoint(ckpt_path, warp_model, refiner_model, optimizer, epoch, args)
                 with torch.no_grad():
+                    use_refiner = should_use_refiner(args.sample_stage, epoch, args.warp_warmup_epochs)
                     save_and_log_samples(
                         out_dir,
                         f"sample_ep{epoch:03d}.png",
@@ -443,6 +444,7 @@ def main():
                         fixed_dist,
                         fixed_gt,
                         args,
+                        use_refiner=use_refiner,
                         wandb_run=wandb_run,
                         step=global_step,
                     )
@@ -453,7 +455,7 @@ def main():
     elif args.mode == "sample":
         if not args.ckpt:
             raise ValueError("--ckpt is required in sample mode")
-        load_hybrid_checkpoint(args.ckpt, warp_model, refiner_model, device)
+        checkpoint = load_hybrid_checkpoint(args.ckpt, warp_model, refiner_model, device)
         warp_model.eval()
         refiner_model.eval()
 
@@ -465,6 +467,10 @@ def main():
 
         print("Generating hybrid field samples...")
         with torch.no_grad():
+            checkpoint_epoch = checkpoint.get("epoch", 0) if isinstance(checkpoint, dict) else 0
+            checkpoint_args = checkpoint.get("args", {}) if isinstance(checkpoint, dict) else {}
+            warmup_epochs = checkpoint_args.get("warp_warmup_epochs", args.warp_warmup_epochs)
+            use_refiner = should_use_refiner(args.sample_stage, checkpoint_epoch, warmup_epochs)
             save_and_log_samples(
                 out_dir,
                 "inference_hybrid_field.png",
@@ -474,6 +480,7 @@ def main():
                 dist_tensor,
                 gt_tensor,
                 args,
+                use_refiner=use_refiner,
             )
 
 
