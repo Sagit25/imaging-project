@@ -8,51 +8,73 @@ class SpatialWarpingModule(nn.Module):
         self.model = model
         self.smoothness_weight = smoothness_weight
 
-    def forward_warp(self, dist_tensor, flow_field):
-        """
-        dist_tensor: [B, 3, H, W]
-        flow_field: [B, 2, H, W]
-        """
-        B, _, H, W = dist_tensor.shape
-        device = dist_tensor.device
-        
+    def make_sampling_grid(self, flow_field):
+        B, _, H, W = flow_field.shape
+        device = flow_field.device
+
         grid_y, grid_x = torch.meshgrid(
             torch.linspace(-1, 1, H, device=device),
             torch.linspace(-1, 1, W, device=device),
             indexing='ij'
         )
-        identity_grid = torch.stack([grid_x, grid_y], dim=0).unsqueeze(0).repeat(B, 1, 1, 1) # [B, 2, H, W]
-        
-        sampling_grid = identity_grid + flow_field # [B, 2, H, W]
-        sampling_grid = sampling_grid.permute(0, 2, 3, 1)
-        
-        unwarped_pred = F.grid_sample(
-            dist_tensor, 
-            sampling_grid, 
-            mode='bilinear', 
-            padding_mode='zeros', 
+        identity_grid = torch.stack([grid_x, grid_y], dim=0).unsqueeze(0).repeat(B, 1, 1, 1)
+        sampling_grid = identity_grid + flow_field
+        return sampling_grid.permute(0, 2, 3, 1)
+
+    def forward_warp(self, input_tensor, flow_field, mode='bilinear', padding_mode='border'):
+        """
+        input_tensor: [B, C, H, W]
+        flow_field: [B, 2, H, W]
+        """
+        sampling_grid = self.make_sampling_grid(flow_field)
+
+        return F.grid_sample(
+            input_tensor,
+            sampling_grid,
+            mode=mode,
+            padding_mode=padding_mode,
             align_corners=True
         )
-        return unwarped_pred
+
+    def flow_smoothness_loss(self, flow_field):
+        dy = flow_field[:, :, 1:, :] - flow_field[:, :, :-1, :]
+        dx = flow_field[:, :, :, 1:] - flow_field[:, :, :, :-1]
+        return torch.mean(dy**2) + torch.mean(dx**2)
+
+    def build_warp_outputs(self, model_input, dist_tensor):
+        B = model_input.shape[0]
+        device = model_input.device
+
+        flow_field = self.model(model_input, torch.zeros(B, device=device))
+        warped_rgb = self.forward_warp(dist_tensor, flow_field, padding_mode='border')
+        warped_mask = self.forward_warp(model_input[:, 3:4], flow_field, padding_mode='zeros').clamp(0, 1)
+        warped_border = self.forward_warp(model_input[:, 4:5], flow_field, padding_mode='zeros').clamp(0, 1)
+        hole_mask = (1.0 - warped_mask).clamp(0, 1)
+
+        return {
+            "flow": flow_field,
+            "warped_rgb": warped_rgb,
+            "warped_mask": warped_mask,
+            "warped_border": warped_border,
+            "hole_mask": hole_mask,
+        }
+
+    def weighted_l1_loss(self, pred, target, weight):
+        weight = weight.expand_as(pred)
+        denom = weight.sum().clamp_min(1.0)
+        return (torch.abs(pred - target) * weight).sum() / denom
 
     def compute_loss(self, model_input, dist_tensor, gt_tensor):
         """
-        model_input: [B, 5, H, W]
+        model_input: [B, 7, H, W]
         dist_tensor: [B, 3, H, W]
         gt_tensor: [B, 3, H, W]
         """
-        B = model_input.shape[0]
-        device = model_input.device
-        
-        flow_field = self.model(model_input, torch.zeros(B, device=device))
-        unwarped_pred = self.forward_warp(dist_tensor, flow_field)
-        
-        recon_loss = F.mse_loss(unwarped_pred, gt_tensor)
-        
-        dy = flow_field[:, :, 1:, :] - flow_field[:, :, :-1, :]
-        dx = flow_field[:, :, :, 1:] - flow_field[:, :, :, :-1]
-        smooth_loss = torch.mean(dy**2) + torch.mean(dx**2) # TV
-        
+        outputs = self.build_warp_outputs(model_input, dist_tensor)
+        valid_weight = (outputs["warped_mask"] * (1.0 - outputs["warped_border"])).detach()
+
+        recon_loss = self.weighted_l1_loss(outputs["warped_rgb"], gt_tensor, valid_weight)
+        smooth_loss = self.flow_smoothness_loss(outputs["flow"])
         total_loss = recon_loss + self.smoothness_weight * smooth_loss
-        
-        return total_loss, unwarped_pred, flow_field
+
+        return total_loss, outputs["warped_rgb"], outputs["flow"], outputs

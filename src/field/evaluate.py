@@ -14,55 +14,55 @@ from tqdm import tqdm
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 
 from dataloader import MirrorReflectionsDataset
+from flow_refiner import CFGFlowRefiner, build_refiner_condition
+from main import build_refiner_model, build_warp_model, load_hybrid_checkpoint
 from warp_model import SpatialWarpingModule
-from unet import UNetModel
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def build_model(device):
-    return UNetModel(
-        image_size=256,
-        in_channels=5,
-        model_channels=128,
-        out_channels=2,
-        num_res_blocks=2,
-        attention_resolutions=(4, 8, 16),
-        dropout=0.1,
-        channel_mult=(1, 2, 2, 4, 4),
-        use_checkpoint=True
-    ).to(device)
-
 def evaluate():
-    parser = argparse.ArgumentParser(description="Evaluate Deterministic Spatial Warping Rectification")
+    parser = argparse.ArgumentParser(description="Evaluate Hybrid Spatial Warping + Flow Matching Refinement")
     parser.add_argument("--data_dir", type=str, default=str(REPO_ROOT / "dataset"), help="Path to test dataset")
-    parser.add_argument("--ckpt", type=str, required=True, help="Path to model checkpoint")
+    parser.add_argument("--ckpt", type=str, required=True, help="Path to hybrid field checkpoint")
     parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--cfg_scale", type=float, default=3.0)
+    parser.add_argument("--sample_steps", type=int, default=50)
+    parser.add_argument("--border_width", type=int, default=5)
     parser.add_argument("--max_batches", type=int, default=0, help="Optional limit for smoke tests; 0 evaluates all batches")
     args = parser.parse_args()
+    if args.sample_steps < 1:
+        raise ValueError("--sample_steps must be at least 1")
 
     device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
-    
-    model = build_model(device)
-    model.load_state_dict(torch.load(args.ckpt, map_location=device))
-    model.eval()
-    
-    warper = SpatialWarpingModule(model)
-    
-    dataset = MirrorReflectionsDataset(args.data_dir, image_size=256, is_train=False)
+
+    warp_model = build_warp_model(device)
+    refiner_model = build_refiner_model(device)
+    load_hybrid_checkpoint(args.ckpt, warp_model, refiner_model, device)
+    warp_model.eval()
+    refiner_model.eval()
+
+    warper = SpatialWarpingModule(warp_model)
+    flow_refiner = CFGFlowRefiner(refiner_model)
+
+    dataset = MirrorReflectionsDataset(args.data_dir, image_size=256, is_train=False, border_width=args.border_width)
     if len(dataset) == 0:
         raise ValueError(f"No input images found in {args.data_dir}")
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
-    
-    psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
-    ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
-    
-    total_psnr = 0.0
-    total_ssim = 0.0
+
+    refined_psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
+    refined_ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
+    warped_psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
+    warped_ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
+
+    total_refined_psnr = 0.0
+    total_refined_ssim = 0.0
+    total_warped_psnr = 0.0
+    total_warped_ssim = 0.0
     num_batches = 0
-    
-    print(f"Starting evaluation on {len(dataset)} images...")
-    
+
+    print(f"Starting hybrid evaluation on {len(dataset)} images...")
+
     with torch.no_grad():
         for batch_idx, (model_input, dist_tensor, gt_tensor) in enumerate(tqdm(dataloader, desc="Evaluating")):
             if args.max_batches and batch_idx >= args.max_batches:
@@ -70,32 +70,32 @@ def evaluate():
             model_input = model_input.to(device)
             dist_tensor = dist_tensor.to(device)
             gt_tensor = gt_tensor.to(device)
-            
-            dummy_t = torch.zeros(model_input.shape[0], device=device)
-            flow_field = model(model_input, dummy_t)
-            unwarped_pred = warper.forward_warp(dist_tensor, flow_field)
 
-            samples = (unwarped_pred * 0.5 + 0.5).clamp(0, 1)
+            warp_outputs = warper.build_warp_outputs(model_input, dist_tensor)
+            condition = build_refiner_condition(model_input, dist_tensor, warp_outputs)
+            refined_pred = flow_refiner.sample(condition, num_steps=args.sample_steps, cfg_scale=args.cfg_scale)
+
+            refined = (refined_pred * 0.5 + 0.5).clamp(0, 1)
+            warped = (warp_outputs["warped_rgb"] * 0.5 + 0.5).clamp(0, 1)
             gt = (gt_tensor * 0.5 + 0.5).clamp(0, 1)
-            
-            psnr_val = psnr_metric(samples, gt)
-            ssim_val = ssim_metric(samples, gt)
-            
-            total_psnr += psnr_val.item()
-            total_ssim += ssim_val.item()
+
+            total_refined_psnr += refined_psnr_metric(refined, gt).item()
+            total_refined_ssim += refined_ssim_metric(refined, gt).item()
+            total_warped_psnr += warped_psnr_metric(warped, gt).item()
+            total_warped_ssim += warped_ssim_metric(warped, gt).item()
             num_batches += 1
-            
+
     if num_batches == 0:
         raise ValueError("No evaluation batches available; lower --batch_size or add more data.")
 
-    avg_psnr = total_psnr / num_batches
-    avg_ssim = total_ssim / num_batches
-    
     print("-" * 30)
-    print(f"Evaluation Results:")
-    print(f"Average PSNR: {avg_psnr:.4f} dB")
-    print(f"Average SSIM: {avg_ssim:.4f}")
+    print("Evaluation Results:")
+    print(f"Warped PSNR:  {total_warped_psnr / num_batches:.4f} dB")
+    print(f"Warped SSIM:  {total_warped_ssim / num_batches:.4f}")
+    print(f"Refined PSNR: {total_refined_psnr / num_batches:.4f} dB")
+    print(f"Refined SSIM: {total_refined_ssim / num_batches:.4f}")
     print("-" * 30)
+
 
 if __name__ == "__main__":
     evaluate()
