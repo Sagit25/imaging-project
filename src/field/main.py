@@ -228,6 +228,9 @@ def main():
         for epoch in range(start_epoch, args.epochs + 1):
             model.train()
             epoch_loss = 0
+            epoch_recon_loss = 0
+            epoch_smooth_loss = 0
+            epoch_weighted_smooth_loss = 0
             processed_batches = 0
 
             pbar = tqdm(dataloader, desc=f"Epoch {epoch}/{args.epochs}")
@@ -240,19 +243,45 @@ def main():
 
                 optimizer.zero_grad()
                 with autocast_context(device, use_amp):
-                    loss, unwarped_pred, _ = warper.compute_loss(model_input, dist_tensor, gt_tensor)
+                    losses = warper.compute_loss_components(model_input, dist_tensor, gt_tensor)
+                    loss = losses["total_loss"]
+                    recon_loss = losses["recon_loss"]
+                    smooth_loss = losses["smooth_loss"]
+                    weighted_smooth_loss = losses["weighted_smooth_loss"]
 
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
 
                 epoch_loss += loss.item()
+                epoch_recon_loss += recon_loss.item()
+                epoch_smooth_loss += smooth_loss.item()
+                epoch_weighted_smooth_loss += weighted_smooth_loss.item()
                 processed_batches += 1
                 global_step += 1
-                pbar.set_postfix({"loss": f"{loss.item():.4f}"})
-                wandb_log(wandb_run, {"train/loss": loss.item(), "epoch": epoch}, step=global_step)
+                pbar.set_postfix(
+                    {
+                        "loss": f"{loss.item():.4f}",
+                        "recon": f"{recon_loss.item():.4f}",
+                        "smooth": f"{smooth_loss.item():.6f}",
+                    }
+                )
+                wandb_log(
+                    wandb_run,
+                    {
+                        "train/loss": loss.item(),
+                        "train/recon_loss": recon_loss.item(),
+                        "train/smooth_loss": smooth_loss.item(),
+                        "train/weighted_smooth_loss": weighted_smooth_loss.item(),
+                        "epoch": epoch,
+                    },
+                    step=global_step,
+                )
 
             avg_epoch_loss = epoch_loss / processed_batches
+            avg_epoch_recon_loss = epoch_recon_loss / processed_batches
+            avg_epoch_smooth_loss = epoch_smooth_loss / processed_batches
+            avg_epoch_weighted_smooth_loss = epoch_weighted_smooth_loss / processed_batches
 
             # Validation pass. The warp model is deterministic, but we seed
             # identically each epoch (as in flow) so val/loss is comparable across
@@ -262,6 +291,9 @@ def main():
             cuda_rng_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
             torch.manual_seed(0)
             val_loss = 0
+            val_recon_loss = 0
+            val_smooth_loss = 0
+            val_weighted_smooth_loss = 0
             val_batches = 0
             with torch.no_grad():
                 for batch_idx, (model_input, dist_tensor, gt_tensor) in enumerate(val_dataloader):
@@ -271,16 +303,33 @@ def main():
                     dist_tensor = dist_tensor.to(device)
                     gt_tensor = gt_tensor.to(device)
                     with autocast_context(device, use_amp):
-                        val_loss += warper.compute_loss(model_input, dist_tensor, gt_tensor)[0].item()
+                        val_losses = warper.compute_loss_components(model_input, dist_tensor, gt_tensor)
+                        val_loss += val_losses["total_loss"].item()
+                        val_recon_loss += val_losses["recon_loss"].item()
+                        val_smooth_loss += val_losses["smooth_loss"].item()
+                        val_weighted_smooth_loss += val_losses["weighted_smooth_loss"].item()
                     val_batches += 1
             avg_val_loss = val_loss / val_batches
+            avg_val_recon_loss = val_recon_loss / val_batches
+            avg_val_smooth_loss = val_smooth_loss / val_batches
+            avg_val_weighted_smooth_loss = val_weighted_smooth_loss / val_batches
             torch.set_rng_state(rng_state)
             if cuda_rng_state is not None:
                 torch.cuda.set_rng_state_all(cuda_rng_state)
 
             wandb_log(
                 wandb_run,
-                {"train/epoch_loss": avg_epoch_loss, "val/loss": avg_val_loss, "epoch": epoch},
+                {
+                    "train/epoch_loss": avg_epoch_loss,
+                    "train/epoch_recon_loss": avg_epoch_recon_loss,
+                    "train/epoch_smooth_loss": avg_epoch_smooth_loss,
+                    "train/epoch_weighted_smooth_loss": avg_epoch_weighted_smooth_loss,
+                    "val/loss": avg_val_loss,
+                    "val/recon_loss": avg_val_recon_loss,
+                    "val/smooth_loss": avg_val_smooth_loss,
+                    "val/weighted_smooth_loss": avg_val_weighted_smooth_loss,
+                    "epoch": epoch,
+                },
                 step=global_step,
             )
 

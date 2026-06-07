@@ -35,7 +35,7 @@ class SpatialWarpingModule(nn.Module):
         )
         return unwarped_pred
 
-    def compute_loss(self, model_input, dist_tensor, gt_tensor):
+    def compute_loss_components(self, model_input, dist_tensor, gt_tensor):
         """
         model_input: [B, 5, H, W]
         dist_tensor: [B, 3, H, W]
@@ -53,6 +53,21 @@ class SpatialWarpingModule(nn.Module):
         dx = flow_field[:, :, :, 1:] - flow_field[:, :, :, :-1]
         smooth_loss = torch.mean(dy**2) + torch.mean(dx**2) # TV
         
-        total_loss = recon_loss + self.smoothness_weight * smooth_loss
+        weighted_smooth_loss = self.smoothness_weight * smooth_loss
+        total_loss = recon_loss + weighted_smooth_loss
         
+        return {
+            "total_loss": total_loss,
+            "recon_loss": recon_loss,
+            "smooth_loss": smooth_loss,
+            "weighted_smooth_loss": weighted_smooth_loss,
+            "unwarped_pred": unwarped_pred,
+            "flow_field": flow_field,
+        }
+
+    def compute_loss(self, model_input, dist_tensor, gt_tensor):
+        losses = self.compute_loss_components(model_input, dist_tensor, gt_tensor)
+        total_loss = losses["total_loss"]
+        unwarped_pred = losses["unwarped_pred"]
+        flow_field = losses["flow_field"]
         return total_loss, unwarped_pred, flow_field
