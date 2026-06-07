@@ -1,5 +1,7 @@
 import os
 import argparse
+import re
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 import torch
@@ -17,6 +19,54 @@ from warp_model import SpatialWarpingModule
 from unet import UNetModel
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def infer_epoch_from_checkpoint(path):
+    matches = re.findall(r"(?:^|[_-])ep(?:och)?[_-]?(\d+)", Path(path).stem)
+    return int(matches[-1]) if matches else 0
+
+
+def extract_model_state(checkpoint):
+    if isinstance(checkpoint, Mapping):
+        for key in ("model_state_dict", "state_dict", "model"):
+            value = checkpoint.get(key)
+            if isinstance(value, Mapping):
+                return value
+    return checkpoint
+
+
+def load_checkpoint(path, model, device, optimizer=None, scaler=None, resume_epoch=None):
+    checkpoint = torch.load(path, map_location=device)
+    model.load_state_dict(extract_model_state(checkpoint))
+
+    last_epoch = infer_epoch_from_checkpoint(path)
+    global_step = 0
+    restored_optimizer = False
+    restored_scaler = False
+
+    if isinstance(checkpoint, Mapping):
+        last_epoch = int(checkpoint.get("epoch", last_epoch))
+        global_step = int(checkpoint.get("global_step", 0))
+
+        optimizer_state = checkpoint.get("optimizer_state_dict")
+        if optimizer is not None and optimizer_state is not None:
+            optimizer.load_state_dict(optimizer_state)
+            restored_optimizer = True
+
+        scaler_state = checkpoint.get("scaler_state_dict")
+        if scaler is not None and scaler_state is not None:
+            scaler.load_state_dict(scaler_state)
+            restored_scaler = True
+
+    if resume_epoch is not None:
+        last_epoch = resume_epoch
+
+    return {
+        "last_epoch": last_epoch,
+        "global_step": global_step,
+        "restored_optimizer": restored_optimizer,
+        "restored_scaler": restored_scaler,
+    }
 
 
 def build_model(device):
@@ -75,24 +125,40 @@ def main():
     parser.add_argument("--out_dir", type=str, default=str(REPO_ROOT / "results" / "field"))
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--ckpt", type=str, default="")
+    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--ckpt", type=str, default="", help="Checkpoint path for sample mode or train-mode resume")
+    parser.add_argument("--resume_epoch", type=int, default=None, help="Last completed epoch for train-mode resume; defaults to parsing --ckpt")
     parser.add_argument("--smooth_weight", type=float, default=0.05, help="Weight for flow smoothness regularization")
     parser.add_argument("--max_batches", type=int, default=0, help="Optional limit for smoke tests; 0 uses all batches")
     parser.add_argument("--num_workers", type=int, default=0, help="DataLoader worker count")
+    parser.add_argument("--save_every", type=int, default=10, help="Save checkpoint and validation sample images every N epochs")
     parser.add_argument("--train_name", type=str, default="", help="Name of the run; used as subfolder under out_dir")
     parser.add_argument("--wandb_mode", type=str, choices=["disabled", "offline", "online"], default="disabled")
     parser.add_argument("--wandb_project", type=str, default="imaging-project")
     parser.add_argument("--wandb_entity", type=str, default="seungho-sukhun")
     args = parser.parse_args()
 
+    resume_path = Path(args.ckpt).expanduser() if args.mode == "train" and args.ckpt else None
+    if resume_path is not None and not resume_path.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {resume_path}")
+    if args.mode == "train" and args.save_every <= 0:
+        raise ValueError("--save_every must be a positive integer")
+
     if args.mode == "train":
-        run_label = args.train_name or "run"
-        args.train_name = f"{datetime.now().strftime('%y%m%d_%H%M')}_{run_label}"
+        if resume_path is not None:
+            if args.train_name:
+                out_dir = os.path.join(args.out_dir, args.train_name)
+            else:
+                out_dir = str(resume_path.parent)
+                args.train_name = resume_path.parent.name
+        else:
+            run_label = args.train_name or "run"
+            args.train_name = f"{datetime.now().strftime('%y%m%d_%H%M')}_{run_label}"
+            out_dir = os.path.join(args.out_dir, args.train_name)
     else:
         args.train_name = args.train_name or (Path(args.ckpt).stem if args.ckpt else "sample")
+        out_dir = os.path.join(args.out_dir, args.train_name)
 
-    out_dir = os.path.join(args.out_dir, args.train_name)
     os.makedirs(out_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
     use_amp = device.type == "cuda"
@@ -108,6 +174,34 @@ def main():
             raise ValueError("No training batches available; lower --batch_size or add more data.")
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+        start_epoch = 1
+        global_step = 0
+
+        if args.ckpt:
+            resume_state = load_checkpoint(
+                args.ckpt,
+                model,
+                device,
+                optimizer=optimizer,
+                scaler=scaler,
+                resume_epoch=args.resume_epoch,
+            )
+            last_epoch = resume_state["last_epoch"]
+            start_epoch = last_epoch + 1
+            batches_per_epoch = min(len(dataloader), args.max_batches) if args.max_batches else len(dataloader)
+            global_step = resume_state["global_step"] or (last_epoch * batches_per_epoch)
+            if start_epoch > args.epochs:
+                raise ValueError(
+                    f"Checkpoint is at epoch {last_epoch}; --epochs is a total epoch target, "
+                    f"so set --epochs to at least {start_epoch} to resume."
+                )
+
+            optimizer_status = "optimizer state restored" if resume_state["restored_optimizer"] else "optimizer starts fresh"
+            scaler_status = "AMP scaler restored" if resume_state["restored_scaler"] else "AMP scaler starts fresh"
+            print(
+                f"Resumed from {args.ckpt}: completed epoch {last_epoch}, "
+                f"continuing at epoch {start_epoch}; {optimizer_status}, {scaler_status}."
+            )
 
         val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
         val_indices = torch.randperm(len(val_dataset))[:4].tolist()
@@ -130,8 +224,8 @@ def main():
             wandb.watch(model, log="all", log_freq=100)
 
         print(f"Starting Spatial Warping training on {device}...")
-        global_step = 0
-        for epoch in range(1, args.epochs + 1):
+        print(f"Writing checkpoints and samples to {out_dir} every {args.save_every} epoch(s).")
+        for epoch in range(start_epoch, args.epochs + 1):
             model.train()
             epoch_loss = 0
             processed_batches = 0
@@ -190,7 +284,7 @@ def main():
                 step=global_step,
             )
 
-            if epoch % 10 == 0:
+            if epoch % args.save_every == 0:
                 torch.save(model.state_dict(), os.path.join(out_dir, f"warp_model_ep{epoch}.pth"))
                 model.eval()
                 with torch.no_grad():
@@ -216,7 +310,8 @@ def main():
     elif args.mode == "sample":
         if not args.ckpt:
             raise ValueError("--ckpt is required in sample mode")
-        model.load_state_dict(torch.load(args.ckpt, map_location=device))
+        checkpoint = torch.load(args.ckpt, map_location=device)
+        model.load_state_dict(extract_model_state(checkpoint))
         model.eval()
 
         dataloader = DataLoader(val_dataset, batch_size=4, shuffle=False)
