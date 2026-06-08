@@ -2,6 +2,7 @@ import os
 import argparse
 from datetime import datetime
 from pathlib import Path
+from copy import deepcopy
 import torch
 from torch.utils.data import DataLoader, random_split
 from torchvision.utils import save_image, make_grid
@@ -68,6 +69,47 @@ def wandb_log(run, data, step=None):
         wandb.log(data, step=step)
 
 
+def update_ema(ema_model, model, ema_rate):
+    with torch.no_grad():
+        for ema_param, param in zip(ema_model.parameters(), model.parameters()):
+            ema_param.mul_(ema_rate).add_(param, alpha=1.0 - ema_rate)
+        for ema_buffer, buffer in zip(ema_model.buffers(), model.buffers()):
+            ema_buffer.copy_(buffer)
+
+
+def load_model_checkpoint(path, model, device, use_ema=True):
+    checkpoint = torch.load(path, map_location=device)
+    if isinstance(checkpoint, dict) and "model" in checkpoint:
+        state_key = "ema" if use_ema and "ema" in checkpoint else "model"
+        model.load_state_dict(checkpoint[state_key])
+        return checkpoint
+
+    model.load_state_dict(checkpoint)
+    return {"model": checkpoint}
+
+
+def save_model_checkpoint(path, model, ema_model, optimizer, epoch, args):
+    torch.save(
+        {
+            "epoch": epoch,
+            "model": model.state_dict(),
+            "ema": ema_model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "args": vars(args),
+        },
+        path,
+    )
+
+
+def seeded_sample(flow_matcher, condition, args):
+    return flow_matcher.sample(
+        condition,
+        num_steps=args.sample_steps,
+        cfg_scale=args.cfg_scale,
+        sample_seed=args.sample_seed,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Advanced Flow Matching for Convex Mirror Rectification")
     parser.add_argument("--mode", type=str, choices=["train", "sample"], required=True)
@@ -77,8 +119,14 @@ def main():
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--ckpt", type=str, default="")
-    parser.add_argument("--cfg_scale", type=float, default=4.0, help="Scale to balance realism and fidelity")
+    parser.add_argument("--cfg_scale", type=float, default=2.0, help="Scale to balance realism and fidelity")
+    parser.add_argument("--cfg_drop_rate", type=float, default=0.05)
+    parser.add_argument("--clean_loss_weight", type=float, default=0.5)
+    parser.add_argument("--lowfreq_loss_weight", type=float, default=0.2)
+    parser.add_argument("--ema_rate", type=float, default=0.999)
+    parser.add_argument("--sample_seed", type=int, default=0)
     parser.add_argument("--sample_steps", type=int, default=50, help="Number of ODE steps used when sampling")
+    parser.add_argument("--save_every", type=int, default=10)
     parser.add_argument("--max_batches", type=int, default=0, help="Optional limit for smoke tests; 0 uses all batches")
     parser.add_argument("--num_workers", type=int, default=0, help="DataLoader worker count")
     parser.add_argument("--train_name", type=str, default="", help="Name of the run; used as subfolder under out_dir")
@@ -102,9 +150,19 @@ def main():
     else:
         device = torch.device("cpu")
     use_amp = device.type == "cuda"
+    if args.sample_steps < 1:
+        raise ValueError("--sample_steps must be at least 1")
     
     model = build_model(device)
-    flow_matcher = CFGFlowMatcher(model, cfg_drop_rate=0.15)
+    ema_model = deepcopy(model).eval()
+    for param in ema_model.parameters():
+        param.requires_grad_(False)
+    flow_matcher = CFGFlowMatcher(
+        model,
+        cfg_drop_rate=args.cfg_drop_rate,
+        clean_loss_weight=args.clean_loss_weight,
+        lowfreq_loss_weight=args.lowfreq_loss_weight,
+    )
     train_dataset, val_dataset, dataset_message = build_datasets(args.data_dir, image_size=256)
     print(dataset_message)
 
@@ -113,6 +171,12 @@ def main():
         if len(dataloader) == 0:
             raise ValueError("No training batches available; lower --batch_size or add more data.")
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+        if args.ckpt:
+            checkpoint = load_model_checkpoint(args.ckpt, model, device, use_ema=False)
+            if isinstance(checkpoint, dict) and "ema" in checkpoint:
+                ema_model.load_state_dict(checkpoint["ema"])
+            else:
+                ema_model.load_state_dict(model.state_dict())
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
         val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
@@ -156,6 +220,7 @@ def main():
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 scaler.step(optimizer)
                 scaler.update()
+                update_ema(ema_model, model, args.ema_rate)
 
                 epoch_loss += loss.item()
                 processed_batches += 1
@@ -193,11 +258,25 @@ def main():
                 step=global_step,
             )
 
-            if epoch % 10 == 0:
-                torch.save(model.state_dict(), os.path.join(out_dir, f"model_ep{epoch:03d}.pth"))
+            should_save = (args.save_every > 0 and epoch % args.save_every == 0) or (epoch == args.epochs)
+            if should_save:
+                save_model_checkpoint(
+                    os.path.join(out_dir, f"model_ep{epoch:03d}.pth"),
+                    model,
+                    ema_model,
+                    optimizer,
+                    epoch,
+                    args,
+                )
                 model.eval()
+                ema_flow_matcher = CFGFlowMatcher(
+                    ema_model,
+                    cfg_drop_rate=0.0,
+                    clean_loss_weight=args.clean_loss_weight,
+                    lowfreq_loss_weight=args.lowfreq_loss_weight,
+                )
                 with torch.no_grad():
-                    samples = flow_matcher.sample(fixed_cond, num_steps=args.sample_steps, cfg_scale=args.cfg_scale)
+                    samples = seeded_sample(ema_flow_matcher, fixed_cond, args)
 
                 samples = (samples * 0.5 + 0.5).clamp(0, 1)
                 gt = (fixed_gt * 0.5 + 0.5).clamp(0, 1)
@@ -219,21 +298,28 @@ def main():
     elif args.mode == "sample":
         if not args.ckpt:
             raise ValueError("--ckpt is required in sample mode")
-        model.load_state_dict(torch.load(args.ckpt, map_location=device))
+        load_model_checkpoint(args.ckpt, model, device, use_ema=True)
         model.eval()
+        flow_matcher = CFGFlowMatcher(
+            model,
+            cfg_drop_rate=0.0,
+            clean_loss_weight=args.clean_loss_weight,
+            lowfreq_loss_weight=args.lowfreq_loss_weight,
+        )
 
         dataloader = DataLoader(val_dataset, batch_size=4, shuffle=False)
 
         condition, gt = next(iter(dataloader))
-        condition = condition.to(device)
+        condition, gt = condition.to(device), gt.to(device)
 
         print(f"Generating unwarped samples with optimized CFG Scale ({args.cfg_scale})...")
-        samples = flow_matcher.sample(condition, num_steps=args.sample_steps, cfg_scale=args.cfg_scale)
+        samples = seeded_sample(flow_matcher, condition, args)
 
         samples = (samples * 0.5 + 0.5).clamp(0, 1)
         distorted = (condition[:, :3] * 0.5 + 0.5).clamp(0, 1)
+        gt = (gt * 0.5 + 0.5).clamp(0, 1)
 
-        comparison = torch.cat([distorted, samples], dim=0)
+        comparison = torch.cat([distorted, samples, gt], dim=0)
         save_image(comparison, os.path.join(out_dir, f"inference_cfg_{args.cfg_scale}.png"), nrow=4)
 
 if __name__ == "__main__":
