@@ -2,6 +2,11 @@
 
 SNU Topics in Computer Graphics (Computational Imaging) course final project.
 
+## Team Member
+
+- Sukhun Yang (sukhuny@snu.ac.kr)
+- Seungho Lee (lxxseunghh@snu.ac.kr)
+
 ## Project Information
 
 This project explores neural rectification of distorted convex mirror images. 
