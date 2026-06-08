@@ -1,0 +1,9 @@
+[project]
+name = "imaging-project"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "torchmetrics>=1.9.0",
+]

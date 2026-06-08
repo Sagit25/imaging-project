@@ -9,7 +9,7 @@ os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
 os.makedirs(os.path.join(os.environ["XDG_CACHE_HOME"], "fontconfig"), exist_ok=True)
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 
@@ -19,6 +19,50 @@ from main import build_refiner_model, build_warp_model, load_hybrid_checkpoint, 
 from warp_model import SpatialWarpingModule
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def build_model(device):
+    return UNetModel(
+        image_size=256,
+        in_channels=5,
+        model_channels=128,
+        out_channels=2,
+        num_res_blocks=2,
+        attention_resolutions=(4, 8, 16),
+        dropout=0.1,
+        channel_mult=(1, 2, 2, 4, 4),
+        use_checkpoint=True
+    ).to(device)
+
+
+def build_eval_dataset(data_dir, image_size=256, val_fraction=0.1, seed=0):
+    train_dir = os.path.join(data_dir, "train")
+    val_dir = os.path.join(data_dir, "val")
+    train_dataset = MirrorReflectionsDataset(train_dir, image_size=image_size)
+    val_dataset = MirrorReflectionsDataset(val_dir, image_size=image_size, is_train=False)
+
+    if len(train_dataset) > 0 and len(val_dataset) > 0:
+        return val_dataset, f"Using validation dataset: {val_dir}"
+
+    flat_dataset = MirrorReflectionsDataset(data_dir, image_size=image_size)
+    if len(flat_dataset) == 0:
+        raise ValueError(
+            f"No input images found in {data_dir}. Expected *_input.png files in "
+            f"{data_dir} or split folders {train_dir} and {val_dir}."
+        )
+
+    if len(flat_dataset) == 1:
+        return flat_dataset, f"Using the single image in {data_dir} for validation"
+
+    val_size = max(1, int(round(len(flat_dataset) * val_fraction)))
+    train_size = len(flat_dataset) - val_size
+    generator = torch.Generator().manual_seed(seed)
+    _, val_subset = random_split(flat_dataset, [train_size, val_size], generator=generator)
+    return (
+        val_subset,
+        f"Using deterministic flat dataset validation split from {data_dir}: "
+        f"{train_size} train / {val_size} val",
+    )
 
 
 def evaluate():
@@ -36,24 +80,15 @@ def evaluate():
         raise ValueError("--sample_steps must be at least 1")
 
     device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
-
-    warp_model = build_warp_model(device)
-    refiner_model = build_refiner_model(device)
-    checkpoint = load_hybrid_checkpoint(args.ckpt, warp_model, refiner_model, device)
-    warp_model.eval()
-    refiner_model.eval()
-
-    warper = SpatialWarpingModule(warp_model)
-    flow_refiner = CFGFlowRefiner(refiner_model)
-
-    checkpoint_epoch = checkpoint.get("epoch", 0) if isinstance(checkpoint, dict) else 0
-    checkpoint_args = checkpoint.get("args", {}) if isinstance(checkpoint, dict) else {}
-    warmup_epochs = checkpoint_args.get("warp_warmup_epochs", args.warp_warmup_epochs)
-    use_refiner = should_use_refiner(args.sample_stage, checkpoint_epoch, warmup_epochs)
-
-    dataset = MirrorReflectionsDataset(args.data_dir, image_size=256, is_train=False)
-    if len(dataset) == 0:
-        raise ValueError(f"No input images found in {args.data_dir}")
+    
+    model = build_model(device)
+    model.load_state_dict(torch.load(args.ckpt, map_location=device))
+    model.eval()
+    
+    warper = SpatialWarpingModule(model)
+    
+    dataset, dataset_message = build_eval_dataset(args.data_dir)
+    print(dataset_message)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
 
     refined_psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
