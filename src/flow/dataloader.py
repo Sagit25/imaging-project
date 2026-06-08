@@ -37,8 +37,8 @@ class MirrorReflectionsDataset(Dataset):
         file_id = base_name.rsplit('_input', 1)[0]
         gt_path = os.path.join(self.root_dir, f"{file_id}_gt.png")
 
-        if not os.path.exists(gt_path):
-            raise FileNotFoundError(f"Ground truth file not found for: {file_id}_gt")
+        if gt_path is None:
+            raise FileNotFoundError(f"None ground truth file found for: {file_id}_gt")
 
         # Mirror reconstruction: flip the distorted input left-right so the
         # network only has to learn the undistortion, not the mirror flip.
@@ -61,3 +61,4 @@ class MirrorReflectionsDataset(Dataset):
         condition = torch.cat([dist_tensor, mask_tensor, grid_coords], dim=0)
         
         return condition, unwarped_tensor
+    

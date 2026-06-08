@@ -15,7 +15,6 @@ except ImportError:
     wandb = None
 
 from dataloader import MirrorReflectionsDataset
-from flow_refiner import CFGFlowRefiner, build_refiner_condition
 from warp_model import SpatialWarpingModule
 from unet import UNetModel
 
@@ -80,34 +79,20 @@ def build_model(device):
         attention_resolutions=(4, 8, 16),
         dropout=0.1,
         channel_mult=(1, 2, 2, 4, 4),
-        use_checkpoint=True,
-    ).to(device)
-
-
-def build_refiner_model(device):
-    return UNetModel(
-        image_size=256,
-        in_channels=11,
-        model_channels=64,
-        out_channels=3,
-        num_res_blocks=2,
-        attention_resolutions=(4, 8, 16),
-        dropout=0.1,
-        channel_mult=(1, 2, 2, 4),
-        use_checkpoint=True,
+        use_checkpoint=True
     ).to(device)
 
 
 def build_datasets(data_dir, image_size=256, val_fraction=0.1, seed=0):
     train_dir = os.path.join(data_dir, "train")
     val_dir = os.path.join(data_dir, "val")
-    train_dataset = MirrorReflectionsDataset(train_dir, image_size=image_size, is_train=True)
+    train_dataset = MirrorReflectionsDataset(train_dir, image_size=image_size)
     val_dataset = MirrorReflectionsDataset(val_dir, image_size=image_size, is_train=False)
 
     if len(train_dataset) > 0 and len(val_dataset) > 0:
         return train_dataset, val_dataset, f"Using split dataset: {train_dir}, {val_dir}"
 
-    flat_dataset = MirrorReflectionsDataset(data_dir, image_size=image_size, is_train=True)
+    flat_dataset = MirrorReflectionsDataset(data_dir, image_size=image_size)
     if len(flat_dataset) == 0:
         raise ValueError(
             f"No input images found in {data_dir}. Expected *_input.png files in "
@@ -121,11 +106,7 @@ def build_datasets(data_dir, image_size=256, val_fraction=0.1, seed=0):
     train_size = len(flat_dataset) - val_size
     generator = torch.Generator().manual_seed(seed)
     train_subset, val_subset = random_split(flat_dataset, [train_size, val_size], generator=generator)
-    return (
-        train_subset,
-        val_subset,
-        f"Using deterministic flat dataset split from {data_dir}: {train_size} train / {val_size} val",
-    )
+    return train_subset, val_subset, f"Using deterministic flat dataset split from {data_dir}: {train_size} train / {val_size} val"
 
 
 def autocast_context(device, enabled):
@@ -137,118 +118,8 @@ def wandb_log(run, data, step=None):
         wandb.log(data, step=step)
 
 
-def load_hybrid_checkpoint(path, warp_model, refiner_model, device):
-    checkpoint = torch.load(path, map_location=device)
-    if not isinstance(checkpoint, dict) or "warp" not in checkpoint or "refiner" not in checkpoint:
-        raise ValueError("--ckpt must point to a hybrid field checkpoint with 'warp' and 'refiner' states")
-
-    warp_model.load_state_dict(checkpoint["warp"])
-    refiner_model.load_state_dict(checkpoint["refiner"])
-    return checkpoint
-
-
-def save_hybrid_checkpoint(path, warp_model, refiner_model, optimizer, epoch, args):
-    torch.save(
-        {
-            "epoch": epoch,
-            "warp": warp_model.state_dict(),
-            "refiner": refiner_model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "args": vars(args),
-        },
-        path,
-    )
-
-
-def build_comparison_condition(model_input, dist_tensor, warp_outputs):
-    return build_refiner_condition(model_input, dist_tensor, warp_outputs)
-
-
-def denormalize_image(tensor):
-    return (tensor * 0.5 + 0.5).clamp(0, 1)
-
-
-def should_use_refiner(sample_stage, epoch, warmup_epochs):
-    if sample_stage == "warp":
-        return False
-    if sample_stage == "refine":
-        return True
-    return epoch > warmup_epochs
-
-
-def compute_hybrid_loss(
-    warper,
-    flow_refiner,
-    model_input,
-    dist_tensor,
-    gt_tensor,
-    epoch,
-    args,
-):
-    warp_loss, _, _, warp_outputs = warper.compute_loss(model_input, dist_tensor, gt_tensor)
-
-    if epoch <= args.warp_warmup_epochs:
-        refine_loss = torch.zeros((), device=gt_tensor.device)
-        loss = warp_loss
-    else:
-        condition = build_comparison_condition(model_input, dist_tensor, warp_outputs)
-        refine_loss = flow_refiner.compute_loss(gt_tensor, condition)
-        loss = refine_loss + args.warp_loss_weight * warp_loss
-
-    return loss, warp_loss, refine_loss, warp_outputs
-
-
-def save_and_log_samples(
-    out_dir,
-    filename,
-    warper,
-    flow_refiner,
-    model_input,
-    dist_tensor,
-    gt_tensor,
-    args,
-    use_refiner,
-    wandb_run=None,
-    step=None,
-):
-    warp_outputs = warper.build_warp_outputs(model_input, dist_tensor)
-    if use_refiner:
-        condition = build_comparison_condition(model_input, dist_tensor, warp_outputs)
-        final_pred = flow_refiner.sample(
-            condition,
-            num_steps=args.sample_steps,
-            cfg_scale=args.cfg_scale,
-        )
-        stage = "refine"
-    else:
-        final_pred = warp_outputs["warped_rgb"]
-        stage = "warp"
-
-    comparison = torch.cat(
-        [
-            denormalize_image(dist_tensor),
-            denormalize_image(warp_outputs["warped_rgb"]),
-            denormalize_image(final_pred),
-            denormalize_image(gt_tensor),
-        ],
-        dim=0,
-    )
-    save_image(comparison, os.path.join(out_dir, filename), nrow=dist_tensor.shape[0])
-
-    if wandb_run is not None:
-        grid = make_grid(comparison, nrow=dist_tensor.shape[0])
-        wandb_log(
-            wandb_run,
-            {
-                "val/samples": wandb.Image(grid, caption=f"rows: distorted / warped / {stage} / ground-truth"),
-                "sample/stage": stage,
-            },
-            step=step,
-        )
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Hybrid Spatial Warping + Flow Matching Refinement")
+    parser = argparse.ArgumentParser(description="Deterministic Spatial Warping for Convex Mirror Rectification")
     parser.add_argument("--mode", type=str, choices=["train", "sample"], required=True)
     parser.add_argument("--data_dir", type=str, default=str(REPO_ROOT / "dataset"))
     parser.add_argument("--out_dir", type=str, default=str(REPO_ROOT / "results" / "field"))
@@ -257,14 +128,7 @@ def main():
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--ckpt", type=str, default="", help="Checkpoint path for sample mode or train-mode resume")
     parser.add_argument("--resume_epoch", type=int, default=None, help="Last completed epoch for train-mode resume; defaults to parsing --ckpt")
-    parser.add_argument("--smooth_weight", type=float, default=0.05, help="Weight for flow smoothness regularization")
-    parser.add_argument("--warp_warmup_epochs", type=int, default=60)
-    parser.add_argument("--warp_loss_weight", type=float, default=0.2)
-    parser.add_argument("--cfg_drop_rate", type=float, default=0.15)
-    parser.add_argument("--cfg_scale", type=float, default=2.0)
-    parser.add_argument("--sample_steps", type=int, default=50)
-    parser.add_argument("--sample_stage", type=str, choices=["auto", "warp", "refine"], default="auto")
-    parser.add_argument("--save_every", type=int, default=10)
+    parser.add_argument("--smooth_weight", type=float, default=100, help="Weight for flow smoothness regularization")
     parser.add_argument("--max_batches", type=int, default=0, help="Optional limit for smoke tests; 0 uses all batches")
     parser.add_argument("--num_workers", type=int, default=0, help="DataLoader worker count")
     parser.add_argument("--save_every", type=int, default=10, help="Save checkpoint and validation sample images every N epochs")
@@ -296,53 +160,19 @@ def main():
         out_dir = os.path.join(args.out_dir, args.train_name)
 
     os.makedirs(out_dir, exist_ok=True)
-
     device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
     use_amp = device.type == "cuda"
-    if args.sample_steps < 1:
-        raise ValueError("--sample_steps must be at least 1")
-
-    warp_model = build_warp_model(device)
-    refiner_model = build_refiner_model(device)
-    warper = SpatialWarpingModule(warp_model, smoothness_weight=args.smooth_weight)
-    flow_refiner = CFGFlowRefiner(refiner_model, cfg_drop_rate=args.cfg_drop_rate)
-
-    train_dataset, val_dataset, dataset_message = build_datasets(
-        args.data_dir,
-        image_size=256,
-    )
+    model = build_model(device)
+    
+    warper = SpatialWarpingModule(model, smoothness_weight=args.smooth_weight)
+    train_dataset, val_dataset, dataset_message = build_datasets(args.data_dir, image_size=256)
     print(dataset_message)
 
     if args.mode == "train":
-        dataloader = DataLoader(
-            train_dataset,
-            batch_size=args.batch_size,
-            shuffle=True,
-            num_workers=args.num_workers,
-            drop_last=True,
-        )
+        dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, drop_last=True)
         if len(dataloader) == 0:
             raise ValueError("No training batches available; lower --batch_size or add more data.")
-
-        val_dataloader = DataLoader(
-            val_dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=args.num_workers,
-        )
-        if len(val_dataloader) == 0:
-            raise ValueError("No validation batches available; lower --batch_size or add more data.")
-
-        optimizer = torch.optim.AdamW(
-            [
-                {"params": warp_model.parameters(), "lr": args.lr},
-                {"params": refiner_model.parameters(), "lr": args.refiner_lr},
-            ],
-            weight_decay=1e-4,
-        )
-        if args.ckpt:
-            load_hybrid_checkpoint(args.ckpt, warp_model, refiner_model, device)
-
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
         start_epoch = 1
         global_step = 0
@@ -373,6 +203,7 @@ def main():
                 f"continuing at epoch {start_epoch}; {optimizer_status}, {scaler_status}."
             )
 
+        val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
         val_indices = torch.randperm(len(val_dataset))[:4].tolist()
         val_samples = [val_dataset[i] for i in val_indices]
         fixed_input = torch.stack([s[0] for s in val_samples]).to(device)
@@ -390,8 +221,7 @@ def main():
                 config=vars(args),
                 mode=args.wandb_mode,
             )
-            wandb.watch(warp_model, log="all", log_freq=100)
-            wandb.watch(refiner_model, log="all", log_freq=100)
+            wandb.watch(model, log="all", log_freq=100)
 
         print(f"Starting Spatial Warping training on {device}...")
         print(f"Writing checkpoints and samples to {out_dir} every {args.save_every} epoch(s).")
@@ -407,7 +237,6 @@ def main():
             for batch_idx, (model_input, dist_tensor, gt_tensor) in enumerate(pbar):
                 if args.max_batches and batch_idx >= args.max_batches:
                     break
-
                 model_input = model_input.to(device)
                 dist_tensor = dist_tensor.to(device)
                 gt_tensor = gt_tensor.to(device)
@@ -421,11 +250,6 @@ def main():
                     weighted_smooth_loss = losses["weighted_smooth_loss"]
 
                 scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(
-                    list(warp_model.parameters()) + list(refiner_model.parameters()),
-                    1.0,
-                )
                 scaler.step(optimizer)
                 scaler.update()
 
@@ -459,8 +283,10 @@ def main():
             avg_epoch_smooth_loss = epoch_smooth_loss / processed_batches
             avg_epoch_weighted_smooth_loss = epoch_weighted_smooth_loss / processed_batches
 
-            warp_model.eval()
-            refiner_model.eval()
+            # Validation pass. The warp model is deterministic, but we seed
+            # identically each epoch (as in flow) so val/loss is comparable across
+            # epochs, then restore the RNG state so training is unaffected.
+            model.eval()
             rng_state = torch.get_rng_state()
             cuda_rng_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
             torch.manual_seed(0)
@@ -491,9 +317,6 @@ def main():
             if cuda_rng_state is not None:
                 torch.cuda.set_rng_state_all(cuda_rng_state)
 
-            avg_val_loss = val_loss / val_batches
-            avg_val_warp_loss = val_warp_loss / val_batches
-            avg_val_refine_loss = val_refine_loss / val_batches
             wandb_log(
                 wandb_run,
                 {
@@ -509,28 +332,24 @@ def main():
                 },
                 step=global_step,
             )
-            print(
-                f"Epoch {epoch}: "
-                f"avg_loss={avg_epoch_loss:.4f}, "
-                f"val_loss={avg_val_loss:.4f}"
-            )
 
             if epoch % args.save_every == 0:
                 torch.save(model.state_dict(), os.path.join(out_dir, f"warp_model_ep{epoch}.pth"))
                 model.eval()
                 with torch.no_grad():
-                    use_refiner = should_use_refiner(args.sample_stage, epoch, args.warp_warmup_epochs)
-                    save_and_log_samples(
-                        out_dir,
-                        f"sample_ep{epoch:03d}.png",
-                        warper,
-                        flow_refiner,
-                        fixed_input,
-                        fixed_dist,
-                        fixed_gt,
-                        args,
-                        use_refiner=use_refiner,
-                        wandb_run=wandb_run,
+                    _, unwarped_pred, _ = warper.compute_loss(fixed_input, fixed_dist, fixed_gt)
+
+                distorted = (fixed_dist * 0.5 + 0.5).clamp(0, 1)
+                samples = (unwarped_pred * 0.5 + 0.5).clamp(0, 1)
+                gt = (fixed_gt * 0.5 + 0.5).clamp(0, 1)
+
+                comparison = torch.cat([distorted, samples, gt], dim=0)
+                save_image(comparison, os.path.join(out_dir, f"sample_ep{epoch}.png"), nrow=4)
+                if wandb_run is not None:
+                    grid = make_grid(comparison, nrow=4)
+                    wandb_log(
+                        wandb_run,
+                        {"val/samples": wandb.Image(grid, caption="rows: distorted / unwarped / ground-truth")},
                         step=global_step,
                     )
 
@@ -545,29 +364,22 @@ def main():
         model.eval()
 
         dataloader = DataLoader(val_dataset, batch_size=4, shuffle=False)
+
         model_input, dist_tensor, gt_tensor = next(iter(dataloader))
-        model_input = model_input.to(device)
-        dist_tensor = dist_tensor.to(device)
-        gt_tensor = gt_tensor.to(device)
-
-        print("Generating hybrid field samples...")
+        model_input, dist_tensor = model_input.to(device), dist_tensor.to(device)
+        
+        print("Generating unwarped samples using deterministic grid mapping...")
         with torch.no_grad():
-            checkpoint_epoch = checkpoint.get("epoch", 0) if isinstance(checkpoint, dict) else 0
-            checkpoint_args = checkpoint.get("args", {}) if isinstance(checkpoint, dict) else {}
-            warmup_epochs = checkpoint_args.get("warp_warmup_epochs", args.warp_warmup_epochs)
-            use_refiner = should_use_refiner(args.sample_stage, checkpoint_epoch, warmup_epochs)
-            save_and_log_samples(
-                out_dir,
-                "inference_hybrid_field.png",
-                warper,
-                flow_refiner,
-                model_input,
-                dist_tensor,
-                gt_tensor,
-                args,
-                use_refiner=use_refiner,
-            )
-
+            dummy_t = torch.zeros(model_input.shape[0], device=device)
+            flow_field = model(model_input, dummy_t)
+            unwarped_pred = warper.forward_warp(dist_tensor, flow_field)
+        
+        distorted = (dist_tensor * 0.5 + 0.5).clamp(0, 1)
+        samples = (unwarped_pred * 0.5 + 0.5).clamp(0, 1)
+        gt = (gt_tensor * 0.5 + 0.5).clamp(0, 1)
+        
+        comparison = torch.cat([distorted, samples, gt], dim=0)
+        save_image(comparison, os.path.join(out_dir, f"inference_warp.png"), nrow=4)
 
 if __name__ == "__main__":
     main()

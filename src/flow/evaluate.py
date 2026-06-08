@@ -1,60 +1,78 @@
 import os
 import argparse
-import tempfile
 from pathlib import Path
-
-os.environ.setdefault("MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "matplotlib"))
-os.environ.setdefault("XDG_CACHE_HOME", tempfile.gettempdir())
-os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
-os.makedirs(os.path.join(os.environ["XDG_CACHE_HOME"], "fontconfig"), exist_ok=True)
-
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 
 from dataloader import MirrorReflectionsDataset
 from flow_matching_model import CFGFlowMatcher
-from main import build_model, load_model_checkpoint
+from unet import UNetModel
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parent
 
 
-def build_eval_dataset(data_dir):
+def build_model(device):
+    return UNetModel(
+        image_size=256,
+        in_channels=9,
+        model_channels=128,
+        out_channels=3,
+        num_res_blocks=2,
+        attention_resolutions=(8, 16),
+        dropout=0.1,
+        channel_mult=(1, 2, 2, 4, 4),
+        use_checkpoint=False,
+    ).to(device)
+
+
+def build_eval_dataset(data_dir, image_size=256, val_fraction=0.1, seed=0):
+    train_dir = os.path.join(data_dir, "train")
     val_dir = os.path.join(data_dir, "val")
-    val_dataset = MirrorReflectionsDataset(val_dir, image_size=256, is_train=False)
-    if len(val_dataset) > 0:
+    train_dataset = MirrorReflectionsDataset(train_dir, image_size=image_size)
+    val_dataset = MirrorReflectionsDataset(val_dir, image_size=image_size, is_train=False)
+
+    if len(train_dataset) > 0 and len(val_dataset) > 0:
         return val_dataset, f"Using validation dataset: {val_dir}"
 
-    flat_dataset = MirrorReflectionsDataset(data_dir, image_size=256, is_train=False)
+    flat_dataset = MirrorReflectionsDataset(data_dir, image_size=image_size, is_train=False)
     if len(flat_dataset) == 0:
         raise ValueError(
             f"No input images found in {data_dir}. Expected *_input.png files in "
-            f"{data_dir} or {val_dir}."
+            f"{data_dir} or split folders {train_dir} and {val_dir}."
         )
-    return flat_dataset, f"Using flat dataset for evaluation: {data_dir}"
+
+    if len(flat_dataset) == 1:
+        return flat_dataset, f"Using the single image in {data_dir} for validation"
+
+    val_size = max(1, int(round(len(flat_dataset) * val_fraction)))
+    train_size = len(flat_dataset) - val_size
+    generator = torch.Generator().manual_seed(seed)
+    _, val_subset = random_split(flat_dataset, [train_size, val_size], generator=generator)
+    return (
+        val_subset,
+        f"Using deterministic flat dataset validation split from {data_dir}: "
+        f"{train_size} train / {val_size} val",
+    )
 
 def evaluate():
     parser = argparse.ArgumentParser(description="Evaluate Convex Mirror Rectification")
-    parser.add_argument("--data_dir", type=str, default=str(REPO_ROOT / "dataset"), help="Path to test dataset")
+    parser.add_argument("--data_dir", type=str, default=str(REPO_ROOT / "dataset"), help="Path to dataset root")
     parser.add_argument("--ckpt", type=str, required=True, help="Path to model checkpoint")
     parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--cfg_scale", type=float, default=2.0)
+    parser.add_argument("--cfg_scale", type=float, default=4.0)
     parser.add_argument("--num_steps", type=int, default=50)
-    parser.add_argument("--sample_seed", type=int, default=0)
-    parser.add_argument("--use_raw_weights", action="store_true", help="Use raw model weights instead of EMA when available")
     parser.add_argument("--max_batches", type=int, default=0, help="Optional limit for smoke tests; 0 evaluates all batches")
     args = parser.parse_args()
-    if args.num_steps < 1:
-        raise ValueError("--num_steps must be at least 1")
 
     device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
     
     model = build_model(device)
-    load_model_checkpoint(args.ckpt, model, device, use_ema=not args.use_raw_weights)
+    model.load_state_dict(torch.load(args.ckpt, map_location=device))
     model.eval()
     
-    flow_matcher = CFGFlowMatcher(model, cfg_drop_rate=0.0)
+    flow_matcher = CFGFlowMatcher(model)
     
     dataset, dataset_message = build_eval_dataset(args.data_dir)
     print(dataset_message)
@@ -75,12 +93,7 @@ def evaluate():
                 break
             condition, gt = condition.to(device), gt.to(device)
             
-            samples = flow_matcher.sample(
-                condition,
-                num_steps=args.num_steps,
-                cfg_scale=args.cfg_scale,
-                sample_seed=args.sample_seed,
-            )
+            samples = flow_matcher.sample(condition, num_steps=args.num_steps, cfg_scale=args.cfg_scale)
 
             samples = (samples * 0.5 + 0.5).clamp(0, 1)
             gt = (gt * 0.5 + 0.5).clamp(0, 1)
@@ -106,3 +119,4 @@ def evaluate():
 
 if __name__ == "__main__":
     evaluate()
+    
