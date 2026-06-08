@@ -9,7 +9,7 @@ os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
 os.makedirs(os.path.join(os.environ["XDG_CACHE_HOME"], "fontconfig"), exist_ok=True)
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 
@@ -33,6 +33,37 @@ def build_model(device):
         use_checkpoint=True
     ).to(device)
 
+
+def build_eval_dataset(data_dir, image_size=256, val_fraction=0.1, seed=0):
+    train_dir = os.path.join(data_dir, "train")
+    val_dir = os.path.join(data_dir, "val")
+    train_dataset = MirrorReflectionsDataset(train_dir, image_size=image_size)
+    val_dataset = MirrorReflectionsDataset(val_dir, image_size=image_size, is_train=False)
+
+    if len(train_dataset) > 0 and len(val_dataset) > 0:
+        return val_dataset, f"Using validation dataset: {val_dir}"
+
+    flat_dataset = MirrorReflectionsDataset(data_dir, image_size=image_size)
+    if len(flat_dataset) == 0:
+        raise ValueError(
+            f"No input images found in {data_dir}. Expected *_input.png files in "
+            f"{data_dir} or split folders {train_dir} and {val_dir}."
+        )
+
+    if len(flat_dataset) == 1:
+        return flat_dataset, f"Using the single image in {data_dir} for validation"
+
+    val_size = max(1, int(round(len(flat_dataset) * val_fraction)))
+    train_size = len(flat_dataset) - val_size
+    generator = torch.Generator().manual_seed(seed)
+    _, val_subset = random_split(flat_dataset, [train_size, val_size], generator=generator)
+    return (
+        val_subset,
+        f"Using deterministic flat dataset validation split from {data_dir}: "
+        f"{train_size} train / {val_size} val",
+    )
+
+
 def evaluate():
     parser = argparse.ArgumentParser(description="Evaluate Deterministic Spatial Warping Rectification")
     parser.add_argument("--data_dir", type=str, default=str(REPO_ROOT / "dataset"), help="Path to test dataset")
@@ -49,9 +80,8 @@ def evaluate():
     
     warper = SpatialWarpingModule(model)
     
-    dataset = MirrorReflectionsDataset(args.data_dir, image_size=256, is_train=False)
-    if len(dataset) == 0:
-        raise ValueError(f"No input images found in {args.data_dir}")
+    dataset, dataset_message = build_eval_dataset(args.data_dir)
+    print(dataset_message)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
     
     psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
